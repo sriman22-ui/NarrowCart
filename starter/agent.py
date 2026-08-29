@@ -35,6 +35,7 @@ CANDIDATE_POOL     = 500
 FP_WEIGHT          = 100
 CAT_WEIGHT         = 15
 CONSISTENCY_BONUS  = 10_000   # ranks survivors far above non-survivors
+COVERAGE_BONUS     = 1_000    # tiebreaker within survivors: prefer fewer total constraints
 CONFIDENCE_THRESHOLD = 3      # withhold recs while |survivors| > this
 
 
@@ -486,8 +487,22 @@ class Agent:
                 asin for asin in sorted(pool, key=lambda a: -scores.get(a, 0))
                 if self._consistent(asin, observations, init_disclosed)
             ]
+            # Compute how many constraint slots are already accounted for across
+            # all observations (same count for every survivor — they gave identical replies).
+            accounted = len(init_disclosed)
+            for obs in observations:
+                if obs[0] == "ask":
+                    accounted += len(obs[2])
+                elif obs[0] in ("none", "slot0", "override"):
+                    accounted += 1
+
             for asin in survivors:
-                scores[asin] += CONSISTENCY_BONUS
+                phrases = self._asin_phrases.get(asin, [])
+                hard, soft = _card_constraints(phrases)
+                n_total = max(1, len(list(dict.fromkeys([*hard, *soft]))))
+                # Coverage ratio: survivors that fully explain their card with fewer
+                # total constraints rank higher — the most parsimonious survivor wins.
+                scores[asin] += CONSISTENCY_BONUS + COVERAGE_BONUS * accounted / n_total
         else:
             survivors = []
 
@@ -498,8 +513,11 @@ class Agent:
             ranked = list(candidates)
 
         # 6. Confidence gate: withhold until survivors are narrow enough.
-        #    Always release on the final turn so sessions never end with no recommendations.
-        if survivors and len(survivors) > CONFIDENCE_THRESHOLD and turn < 10:
+        #    Also withhold when we have zero observations and zero phrases (browsing/boundary
+        #    turn 1) — any hit there is purely BM25 noise and will be at a weak rank.
+        #    Always release on turn 10 so sessions never end with no recommendations.
+        no_info = not observations and not state["phrases"]
+        if turn < 10 and (no_info or (survivors and len(survivors) > CONFIDENCE_THRESHOLD)):
             top = []
         else:
             top = [{"parent_asin": asin} for asin in ranked[:top_k]]
