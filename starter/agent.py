@@ -24,16 +24,21 @@ COLOR_RE = re.compile(
 )
 MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric")
 SEARCH_FIELDS = ("title", "features", "details", "description", "categories", "store")
+ALLOWED_ATTRIBUTES = {
+    "category", "material", "color", "size", "style", "brand",
+    "budget", "feature", "use_case", "other",
+}
 
-# Ask order: attributes most likely to uniquely identify a product first.
 ASK_PRIORITY = ["material", "color", "budget", "style", "use_case", "size", "feature"]
 
-CANDIDATE_POOL = 500   # BM25 candidates to score per turn
-FP_WEIGHT = 100        # fingerprint exact-match bonus vs BM25 rank tiebreaker (max 1.0)
-CAT_WEIGHT = 15        # per-term category overlap bonus (secondary discriminator)
+CANDIDATE_POOL     = 500
+FP_WEIGHT          = 100
+CAT_WEIGHT         = 15
+CONSISTENCY_BONUS  = 10_000   # ranks survivors far above non-survivors
+CONFIDENCE_THRESHOLD = 3      # withhold recs while |survivors| > this
 
 
-# ── helpers (replicate evaluator logic exactly) ───────────────────────────────
+# ── helpers (exact replicas of evaluator logic) ───────────────────────────────
 
 def _text(value: object) -> str:
     if value is None:
@@ -80,10 +85,7 @@ def _searchable_text(product: dict) -> str:
 
 
 def _intent_phrases(product: dict, limit: int = 180) -> list[str]:
-    """
-    Replicate evaluator's intent_card() and return the up-to-4 cleaned constraint
-    strings (hard_constraints[:2] + soft_preferences[:2]) that can be disclosed.
-    """
+    """Replicate evaluator's intent_card() — returns up to 4 constraint strings."""
     candidates: list[str] = [
         *_flatten_values(product.get("features")),
         *_flatten_values(product.get("details")),
@@ -121,6 +123,26 @@ def _classify(value: str) -> str:
     return "feature"
 
 
+def _coarse_category(categories: object) -> str:
+    """Exact replica of evaluator's coarse_category()."""
+    excluded = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
+    cleaned: list[str] = []
+    for value in (categories or []):
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part.lower() not in excluded:
+                cleaned.append(part)
+    return " ".join(cleaned[-2:]) if cleaned else ""
+
+
+def _card_constraints(phrases: list[str]) -> tuple[list[str], list[str]]:
+    """Reconstruct hard_constraints and soft_preferences from _intent_phrases output."""
+    hard     = phrases[:2]
+    soft_raw = phrases[2:4]
+    soft     = soft_raw if soft_raw else (phrases[:1] if phrases else [])
+    return hard, soft
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class Agent:
@@ -128,20 +150,20 @@ class Agent:
     Conversational search agent.
 
     Core idea: the evaluator's customer script is generated from the target
-    product's own metadata via intent_card(). By pre-computing the same
-    fingerprint for every catalog product, we can reverse-map each disclosed
-    user phrase back to the exact set of products that could have produced it,
-    then rank by how many phrases match.
+    product's own metadata via intent_card(). Pre-computing the same fingerprint
+    for every catalog product lets us reverse-map each disclosed phrase back to
+    candidate products, then apply a transcript-consistency filter to narrow the
+    survivor set before ranking.
     """
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
-        # phrase → set of parent_asins that have it in their intent_card fingerprint
-        self._phrase_index: dict[str, set[str]] = defaultdict(set)
-        # asin → frozenset of lowercased category terms (for secondary scoring)
-        self._cat_terms: dict[str, frozenset] = {}
-        self._state: dict[str, dict] = {}
+        self._phrase_index:  dict[str, set[str]]   = defaultdict(set)
+        self._asin_phrases:  dict[str, list[str]]  = {}          # asin → intent phrases
+        self._cat_terms:     dict[str, frozenset]  = {}
+        self._cat_bucket:    dict[str, list[str]]  = defaultdict(list)  # coarse_cat → [asin]
+        self._state:         dict[str, dict]       = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -154,10 +176,9 @@ class Agent:
         batch: list[tuple] = []
         with self.catalog_path.open(encoding="utf-8") as fh:
             for line in fh:
-                p = json.loads(line)
-                asin = str(p["parent_asin"])
+                p     = json.loads(line)
+                asin  = str(p["parent_asin"])
 
-                # FTS5 row
                 batch.append((
                     asin,
                     _text(p.get("title")),
@@ -171,12 +192,16 @@ class Agent:
                     cur.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                     batch.clear()
 
-                # Phrase fingerprint index
-                for phrase in _intent_phrases(p):
+                phrases = _intent_phrases(p)
+                self._asin_phrases[asin] = phrases
+                for phrase in phrases:
                     self._phrase_index[phrase].add(asin)
 
-                # Category term index (for secondary scoring)
                 self._cat_terms[asin] = frozenset(_terms(_text(p.get("categories"))))
+
+                cat = _coarse_category(p.get("categories"))
+                if cat:
+                    self._cat_bucket[cat].append(asin)
 
         if batch:
             cur.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
@@ -186,35 +211,39 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._state[session_id] = {
-            "phrases":   [],       # exact constraint strings received so far
-            "terms":     set(),    # BM25 search terms (accumulated across turns)
-            "asked":     set(),    # attribute buckets we've asked about
-            "exhausted": set(),    # buckets user said they have no preference for
-            "filled":    set(),    # buckets covered by a received constraint phrase
-            "category":  None,     # coarse-category string from turn 1
+            "phrases":       [],    # accumulated cleaned constraint strings
+            "terms":         set(), # BM25 search terms
+            "asked":         set(), # attribute buckets asked this session
+            "exhausted":     set(), # attributes with no remaining constraints
+            "category":      None,  # coarse-category string from turn 1
+            "last_ask":      None,  # attribute asked in the previous agent turn
+            "observations":  [],    # [(type, ...)] for transcript-consistency filter
+            "init_disclosed": set(),# phrases disclosed in the initial message
         }
 
-    # ── per-turn helpers ────────────────────────────────────────────────────
+    # ── per-turn helpers ─────────────────────────────────────────────────────
 
     def _add_phrase(self, state: dict, raw: str) -> None:
         phrase = _clean(raw)
         if not phrase or phrase in state["phrases"]:
             return
         state["phrases"].append(phrase)
-        state["filled"].add(_classify(phrase))
         for t in _terms(phrase):
             state["terms"].add(t)
 
     def _parse(self, state: dict, msg: str, turn: int) -> None:
-        """Extract disclosed constraint strings and BM25 terms from the user message."""
+        """Extract disclosed constraint strings and BM25 terms; record observations."""
 
-        # Intent override: the old soft-pref IS from the target's fingerprint — keep it.
-        # Only clear `asked` so we can ask fresh questions for the real hard constraint.
+        # Intent override: keep existing phrases (old soft-pref is from the target's card).
+        # Clear asked so we can ask fresh questions for the new hard constraint.
         if re.search(r"ignore my earlier preference", msg, re.I):
             state["asked"].clear()
             m = re.search(r"What I need is:\s*(.+?)\.?\s*$", msg, re.I)
             if m:
-                self._add_phrase(state, m.group(1))
+                new_val = _clean(m.group(1))
+                self._add_phrase(state, new_val)
+                state["observations"].append(("override", new_val))
+                state["init_disclosed"].add(new_val)
             for t in _terms(msg):
                 state["terms"].add(t)
             return
@@ -230,40 +259,59 @@ class Agent:
         # Explicit constraint reply: "For that, what matters is: X; Y."
         m = re.search(r"what matters is:\s*(.+?)\.?\s*$", msg, re.I)
         if m:
-            for part in m.group(1).split("; "):
-                self._add_phrase(state, part)
-            return  # fully parsed
+            parts = [_clean(p) for p in m.group(1).split("; ") if _clean(p)]
+            for p in parts:
+                self._add_phrase(state, p)
+            if state["last_ask"] and parts:
+                state["observations"].append(("ask", state["last_ask"], parts))
+            return
 
         # Buying turn-1 hard constraint: "A key requirement is: X."
         m = re.search(r"key requirement is:\s*(.+?)\.?\s*$", msg, re.I)
         if m:
-            self._add_phrase(state, m.group(1))
+            phrase = _clean(m.group(1))
+            self._add_phrase(state, phrase)
+            state["observations"].append(("slot0", phrase))
+            state["init_disclosed"].add(phrase)
             # fall through to collect remaining BM25 terms
 
-        # Exhaustion / boundary: "I don't have [an additional / a] preference for X"
-        m = re.search(r"don't have (?:an additional |a )?preference for (\w+)", msg, re.I)
-        if m:
-            state["exhausted"].add(m.group(1).lower())
+        # Boundary deflection (one-time): "I don't have a preference for X; please use your judgment"
+        # This is NOT exhaustion — discard attr from asked so it can be re-asked next turn.
+        if re.search(r"don't have a preference for \w+.*use your judgment", msg, re.I):
+            m2 = re.search(r"don't have a preference for (\w+)", msg, re.I)
+            if m2:
+                state["asked"].discard(m2.group(1).lower())
+            for t in _terms(msg):
+                state["terms"].add(t)
             return
 
-        # Intent-override turn-1: "I'm looking for {cat}. {old_soft_pref}"
-        # Extract the old soft pref so it contributes to early retrieval.
+        # Genuine exhaustion: "I don't have an additional preference for X"
+        m = re.search(r"don't have an additional preference for (\w+)", msg, re.I)
+        if m:
+            attr = m.group(1).lower()
+            state["exhausted"].add(attr)
+            state["observations"].append(("none", attr))
+            return
+
+        # Intent-override turn-1: extract old soft pref from "I'm looking for X. {old_pref}"
         if turn == 1:
             m = re.search(r"I'm looking for [^.]+\.\s*(.+)", msg)
             if m:
                 remainder = m.group(1).strip().rstrip(".")
                 if remainder and "exploring" not in remainder.lower():
-                    self._add_phrase(state, remainder)
+                    phrase = _clean(remainder)
+                    self._add_phrase(state, phrase)
+                    state["observations"].append(("softlast", phrase))
 
-        # Always accumulate BM25 terms from the full message.
         for t in _terms(msg):
             state["terms"].add(t)
 
+    # ── retrieval ────────────────────────────────────────────────────────────
+
     def _bm25_candidates(self, state: dict) -> list[str]:
-        terms = list(state["terms"])
+        terms = sorted(state["terms"])  # sorted for determinism
         if not terms:
             return []
-        # Deduplicate and cap at 60 to keep FTS5 fast.
         expr = " OR ".join(f'"{t}"' for t in terms[:60])
         rows = self.connection.execute(
             "SELECT parent_asin FROM products WHERE products MATCH ? "
@@ -272,16 +320,126 @@ class Agent:
         ).fetchall()
         return [row[0] for row in rows]
 
-    def _choose_ask(self, state: dict) -> str | None:
-        # Only skip already-asked or exhausted. Do NOT skip filled — a received
-        # material phrase (e.g. "cotton") doesn't preclude asking material again
-        # to unlock the more specific hard_constraints[1] (e.g. "78% Cotton, 20% Polyester").
-        skip = state["asked"] | state["exhausted"]
-        for attr in ASK_PRIORITY:
-            if attr not in skip:
-                state["asked"].add(attr)
-                return attr
-        return None
+    def _get_candidates(self, state: dict) -> list[str]:
+        """Category bucket when available; BM25 otherwise."""
+        cat = state["category"]
+        if cat and cat in self._cat_bucket:
+            return self._cat_bucket[cat]
+        return self._bm25_candidates(state)
+
+    # ── transcript-consistency filter ────────────────────────────────────────
+
+    def _consistent(self, asin: str, observations: list, init_disclosed: set) -> bool:
+        """Return True if this asin's intent_card could have produced the observed dialogue."""
+        phrases = self._asin_phrases.get(asin)
+        if not phrases:
+            return False
+        hard, soft     = _card_constraints(phrases)
+        all_constraints = list(dict.fromkeys([*hard, *soft]))
+        disclosed       = set(init_disclosed)
+
+        for obs in observations:
+            kind = obs[0]
+
+            if kind == "slot0":
+                # hard_constraints[0] must equal the observed buying constraint
+                if not hard or hard[0] != obs[1]:
+                    return False
+                disclosed.add(obs[1])
+
+            elif kind == "softlast":
+                # soft_preferences[-1] must equal the intent-override opener phrase
+                if not soft or soft[-1] != obs[1]:
+                    return False
+                # NOT added to disclosed in evaluator's intent_override initial message
+
+            elif kind == "ask":
+                attr, observed_phrases = obs[1], obs[2]
+                attr_norm = attr if attr in ALLOWED_ATTRIBUTES else "other"
+                remaining = [v for v in all_constraints if v not in disclosed]
+                expected  = [
+                    v for v in remaining
+                    if attr_norm == "other" or _classify(v) == attr_norm
+                ][:2]
+                if expected != observed_phrases:
+                    return False
+                disclosed.update(expected)
+
+            elif kind == "none":
+                attr      = obs[1]
+                attr_norm = attr if attr in ALLOWED_ATTRIBUTES else "other"
+                remaining = [v for v in all_constraints if v not in disclosed]
+                has_match = any(
+                    attr_norm == "other" or _classify(v) == attr_norm
+                    for v in remaining
+                )
+                if has_match:
+                    return False
+
+            elif kind == "override":
+                disclosed.add(obs[1])
+
+        return True
+
+    # ── information-gain ask policy ──────────────────────────────────────────
+
+    def _shared_disclosed(self, observations: list, init_disclosed: set) -> set:
+        """Disclosed set shared by all survivors (they all gave the same replies)."""
+        disclosed = set(init_disclosed)
+        for obs in observations:
+            if obs[0] == "slot0":
+                disclosed.add(obs[1])
+            elif obs[0] == "ask":
+                disclosed.update(obs[2])
+            elif obs[0] == "override":
+                disclosed.add(obs[1])
+        return disclosed
+
+    def _choose_ask_ig(self, state: dict, survivors: list[str]) -> str | None:
+        """Pick the attribute that minimises expected post-reply survivor-set size."""
+        skip     = state["asked"] | state["exhausted"]
+        attrs    = [a for a in ASK_PRIORITY if a not in skip]
+        if not attrs:
+            return None
+        if len(survivors) < 2:
+            return attrs[0]
+
+        disclosed = self._shared_disclosed(state["observations"], state["init_disclosed"])
+
+        best_attr  = attrs[0]
+        best_score = float("inf")
+
+        for attr in attrs:
+            attr_norm = attr if attr in ALLOWED_ATTRIBUTES else "other"
+            groups: dict[str, int] = defaultdict(int)
+            for asin in survivors:
+                phrases = self._asin_phrases.get(asin, [])
+                hard, soft = _card_constraints(phrases)
+                all_c      = list(dict.fromkeys([*hard, *soft]))
+                remaining  = [v for v in all_c if v not in disclosed]
+                reply      = [
+                    v for v in remaining
+                    if attr_norm == "other" or _classify(v) == attr_norm
+                ][:2]
+                key = "; ".join(reply) if reply else "__none__"
+                groups[key] += 1
+            score = sum(n * n for n in groups.values())
+            if score < best_score:
+                best_score = score
+                best_attr  = attr
+
+        return best_attr
+
+    def _choose_ask(self, state: dict, survivors: list[str]) -> str | None:
+        if survivors:
+            attr = self._choose_ask_ig(state, survivors)
+        else:
+            skip = state["asked"] | state["exhausted"]
+            attr = next((a for a in ASK_PRIORITY if a not in skip), None)
+        if attr:
+            state["asked"].add(attr)
+            state["last_ask"] = attr
+        return attr
 
     # ── main interface ───────────────────────────────────────────────────────
 
@@ -296,16 +454,13 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         state = self._state[session_id]
 
-        # 1. Parse message → accumulate phrases and BM25 terms.
+        # 1. Parse message → accumulate phrases, BM25 terms, observations.
         self._parse(state, user_message, turn)
 
-        # 2. BM25 retrieval over all accumulated terms.
-        candidates = self._bm25_candidates(state)
+        # 2. Retrieve candidate pool (category bucket preferred over BM25).
+        candidates = self._get_candidates(state)
 
-        # 3. Score:
-        #    - Exact fingerprint match (high weight): phrase_index lookup is O(1) per phrase.
-        #    - Category overlap bonus: per matching category term (secondary discriminator).
-        #    - BM25 rank bonus (tiebreaker, max 1.0).
+        # 3. Base scores: fingerprint match + category overlap + BM25 rank.
         scores: Counter = Counter()
         for phrase in state["phrases"]:
             for asin in self._phrase_index.get(phrase, ()):
@@ -318,14 +473,39 @@ class Agent:
         for rank, asin in enumerate(candidates):
             scores[asin] += (CANDIDATE_POOL - rank) / CANDIDATE_POOL
 
-        # 4. Top-k recommendations.
-        if scores:
-            top = [{"parent_asin": asin} for asin, _ in scores.most_common(top_k)]
+        # 4. Transcript-consistency filter.
+        observations   = state["observations"]
+        init_disclosed = state["init_disclosed"]
+        if observations:
+            # Check all phrase-matched + all bucket/BM25 candidates.
+            phrase_asins: set[str] = set()
+            for phrase in state["phrases"]:
+                phrase_asins.update(self._phrase_index.get(phrase, ()))
+            pool = set(candidates) | phrase_asins
+            survivors = [
+                asin for asin in sorted(pool, key=lambda a: -scores.get(a, 0))
+                if self._consistent(asin, observations, init_disclosed)
+            ]
+            for asin in survivors:
+                scores[asin] += CONSISTENCY_BONUS
         else:
-            top = [{"parent_asin": asin} for asin in candidates[:top_k]]
+            survivors = []
 
-        # 5. Clarification question.
-        ask = self._choose_ask(state)
+        # 5. Ranked list.
+        if scores:
+            ranked = [asin for asin, _ in scores.most_common()]
+        else:
+            ranked = list(candidates)
+
+        # 6. Confidence gate: withhold until survivors are narrow enough.
+        #    Always release on the final turn so sessions never end with no recommendations.
+        if survivors and len(survivors) > CONFIDENCE_THRESHOLD and turn < 10:
+            top = []
+        else:
+            top = [{"parent_asin": asin} for asin in ranked[:top_k]]
+
+        # 7. Clarification question (information-gain policy when filter is active).
+        ask = self._choose_ask(state, survivors)
         message = (
             f"Could you tell me your {ask.replace('_', ' ')} preference?"
             if ask
@@ -333,8 +513,8 @@ class Agent:
         )
 
         return {
-            "message": message,
-            "ask_attribute": ask,
+            "message":        message,
+            "ask_attribute":  ask,
             "recommendations": top,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage":          {"prompt_tokens": 0, "completion_tokens": 0},
         }
