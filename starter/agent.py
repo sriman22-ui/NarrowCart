@@ -513,11 +513,17 @@ class Agent:
             ranked = list(candidates)
 
         # 6. Confidence gate: withhold until survivors are narrow enough.
-        #    Also withhold when we have zero observations and zero phrases (browsing/boundary
-        #    turn 1) — any hit there is purely BM25 noise and will be at a weak rank.
-        #    Always release on turn 10 so sessions never end with no recommendations.
-        no_info = not observations and not state["phrases"]
-        if turn < 10 and (no_info or (survivors and len(survivors) > CONFIDENCE_THRESHOLD)):
+        #    Three withhold conditions (always release on turn 10):
+        #    a) No observations + no phrases (browsing/boundary turn 1 — pure noise)
+        #    b) Only slot0 seen so far with >1 survivor — coverage 1/n is too weak a
+        #       tiebreaker; force one Q&A cycle so coverage becomes 2/n and the
+        #       consistency filter can eliminate more candidates.
+        #    c) Normal: survivors exist but are still too many (> CONFIDENCE_THRESHOLD)
+        no_info        = not observations and not state["phrases"]
+        only_slot0     = (len(observations) == 1 and observations[0][0] == "slot0"
+                          and survivors and len(survivors) > 1)
+        too_many       = survivors and len(survivors) > CONFIDENCE_THRESHOLD
+        if turn < 10 and (no_info or only_slot0 or too_many):
             top = []
         else:
             top = [{"parent_asin": asin} for asin in ranked[:top_k]]
