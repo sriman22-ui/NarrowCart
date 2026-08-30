@@ -30,6 +30,12 @@ ALLOWED_ATTRIBUTES = {
 }
 
 ASK_PRIORITY = ["material", "color", "budget", "style", "use_case", "size", "feature"]
+# "other" matches any undisclosed constraint regardless of type (see _classify's
+# "other" passthrough), so it can surface 2 phrases/turn where a typed attribute
+# often surfaces 0-1. Kept out of ASK_PRIORITY itself and appended last so typed
+# attributes are still tried first; never added to state["asked"] (see _choose_ask)
+# so it stays re-askable until genuinely exhausted.
+ASK_POOL = ASK_PRIORITY + ["other"]
 
 CANDIDATE_POOL     = 500
 FP_WEIGHT          = 100
@@ -269,6 +275,7 @@ class Agent:
 
         # Buying turn-1 hard constraint: "A key requirement is: X."
         m = re.search(r"key requirement is:\s*(.+?)\.?\s*$", msg, re.I)
+        slot0_matched = bool(m)
         if m:
             phrase = _clean(m.group(1))
             self._add_phrase(state, phrase)
@@ -295,7 +302,10 @@ class Agent:
             return
 
         # Intent-override turn-1: extract old soft pref from "I'm looking for X. {old_pref}"
-        if turn == 1:
+        # Gated on slot0 not having matched — buying turn-1 messages have the same
+        # "I'm looking for X. {sentence}" shape but the sentence is the hard
+        # constraint disclosure already handled above, not an intent-override pref.
+        if turn == 1 and not slot0_matched:
             m = re.search(r"I'm looking for [^.]+\.\s*(.+)", msg)
             if m:
                 remainder = m.group(1).strip().rstrip(".")
@@ -396,10 +406,36 @@ class Agent:
                 disclosed.add(obs[1])
         return disclosed
 
+    def _can_split(self, state: dict, survivors: list[str]) -> bool:
+        """True if some remaining askable attribute would still partition survivors
+        into more than one reply-group. False means every remaining question would
+        get the same answer from every survivor — asking further cannot change the
+        outcome, so the gate should stop withholding instead of burning turns."""
+        if len(survivors) < 2:
+            return False
+        skip      = state["asked"] | state["exhausted"]
+        attrs     = [a for a in ASK_POOL if a not in skip]
+        disclosed = self._shared_disclosed(state["observations"], state["init_disclosed"])
+        for attr in attrs:
+            attr_norm = attr if attr in ALLOWED_ATTRIBUTES else "other"
+            groups: set[str] = set()
+            for asin in survivors:
+                hard, soft = _card_constraints(self._asin_phrases.get(asin, []))
+                all_c      = list(dict.fromkeys([*hard, *soft]))
+                remaining  = [v for v in all_c if v not in disclosed]
+                reply      = [
+                    v for v in remaining
+                    if attr_norm == "other" or _classify(v) == attr_norm
+                ][:2]
+                groups.add("; ".join(reply) if reply else "__none__")
+                if len(groups) > 1:
+                    return True
+        return False
+
     def _choose_ask_ig(self, state: dict, survivors: list[str]) -> str | None:
         """Pick the attribute that minimises expected post-reply survivor-set size."""
         skip     = state["asked"] | state["exhausted"]
-        attrs    = [a for a in ASK_PRIORITY if a not in skip]
+        attrs    = [a for a in ASK_POOL if a not in skip]
         if not attrs:
             return None
         if len(survivors) < 2:
@@ -436,9 +472,10 @@ class Agent:
             attr = self._choose_ask_ig(state, survivors)
         else:
             skip = state["asked"] | state["exhausted"]
-            attr = next((a for a in ASK_PRIORITY if a not in skip), None)
+            attr = next((a for a in ASK_POOL if a not in skip), None)
         if attr:
-            state["asked"].add(attr)
+            if attr != "other":
+                state["asked"].add(attr)
             state["last_ask"] = attr
         return attr
 
@@ -519,11 +556,16 @@ class Agent:
         #       tiebreaker; force one Q&A cycle so coverage becomes 2/n and the
         #       consistency filter can eliminate more candidates.
         #    c) Normal: survivors exist but are still too many (> CONFIDENCE_THRESHOLD)
+        #    ...unless every remaining askable attribute would get the identical
+        #    reply from every survivor (stalled) — then no further question can
+        #    change the eventual ranked list, so release now instead of waiting
+        #    out the turns until turn 10 forces it anyway.
         no_info        = not observations and not state["phrases"]
         only_slot0     = (len(observations) == 1 and observations[0][0] == "slot0"
                           and survivors and len(survivors) > 1)
-        too_many       = survivors and len(survivors) > CONFIDENCE_THRESHOLD
-        if turn < 10 and (no_info or only_slot0 or too_many):
+        too_many       = bool(survivors) and len(survivors) > CONFIDENCE_THRESHOLD
+        stalled        = bool(survivors) and not self._can_split(state, survivors)
+        if turn < 10 and not stalled and (no_info or only_slot0 or too_many):
             top = []
         else:
             top = [{"parent_asin": asin} for asin in ranked[:top_k]]
