@@ -1,7 +1,7 @@
 # Conversational E-Commerce Search Agent
 
 Submission for the TechJam Conversational E-Commerce Search Challenge — Track 4:
-Shopping Copilot: AI Conversational Search and Recommendations.
+Shopping Copilot: AI Conversational Search and Recommendations. Team SAARS
 
 ## What it does
 
