@@ -1,7 +1,6 @@
-# Conversational E-Commerce Search Agent
+# NarrowCart - Conversational E-Commerce Search & Recommender (Team SAARS - NTU)
 
-Submission for the TechJam Conversational E-Commerce Search Challenge — Track 4:
-Shopping Copilot: AI Conversational Search and Recommendations. Team SAARS
+Tiktok TechJam 2026 Track 4: Shopping Copilot: AI Conversational Search and Recommendations.
 
 ## What it does
 
@@ -122,3 +121,10 @@ Catalog and sessions are derived from Amazon Reviews 2023 (McAuley Lab,
 UCSD). See `DATA_ATTRIBUTION.md`. No session or ground-truth data was
 hand-labeled — all of it traces back to what the organizer released,
 generated through their own evaluator logic.
+
+## Contributions
+
+All team members contributed equally to this project.
+Members: Sriman, Arshad, Raj, Aqil, Sachin
+
+
