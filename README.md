@@ -92,6 +92,8 @@ Python 3.10+ is required; no pip install needed.
 ```bash
 python3 -m evaluator.local_evaluator     # score against the public set
 python3 demo.py buying --auto            # watch one session play out in the terminal
+python3 demo.py --showcase --auto        # one example per scenario type, then the
+                                          # real score over all 200 sessions
 ```
 
 ## Agent interface

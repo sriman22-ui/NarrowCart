@@ -12,6 +12,10 @@ Usage:
     python demo.py --all               # all 200 sessions + aggregate metrics
     python demo.py buying --all        # all buying sessions + metrics
     python demo.py buying --auto       # auto-advance timing (good for recording)
+    python demo.py --showcase --auto   # 1 example per scenario type, then the
+                                        # real full-200-session score (fast --
+                                        # no per-turn printing, good for recording)
+    python demo.py --showcase 2 --auto # 2 examples per scenario type instead of 1
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from evaluator.local_evaluator import (
     catalog_index,
     coarse_category,
     customer_reply,
+    evaluate,
     initial_message,
     load_jsonl,
     materialize_hidden_fields,
@@ -228,12 +233,45 @@ def print_metrics(results: list[dict]) -> None:
     print(f"{BOLD}{_divider('=')}{RESET}\n")
 
 
+def print_final_metrics(result: dict) -> None:
+    """Print the official evaluator's score (evaluate(), same as -m evaluator.local_evaluator)
+    over the whole public set -- no per-turn printing, so this runs in a couple seconds
+    even though it's covering all 200 sessions, not just the ones shown on screen."""
+    print(f"\n{BOLD}{_divider('=')}{RESET}")
+    print(f"{BOLD}  FINAL METRICS  (all {result['sample_count']} public-set sessions){RESET}")
+    print(_divider())
+    print(f"  Hit Rate @ 10   : {GREEN}{BOLD}{result['hit_rate_at_10']:.3f}{RESET}")
+    print(f"  MRR             : {GREEN}{BOLD}{result['mrr']:.3f}{RESET}")
+    print(f"  MTTC            : {YELLOW}{BOLD}{result['mttc']:.2f}{RESET} turns avg to first hit")
+    print(f"  Efficiency      : {YELLOW}{BOLD}{result['efficiency']:.3f}{RESET}")
+    print(f"  {BOLD}TechnicalScore  : {GREEN}{BOLD}{result['recommended_technical_score']:.3f}{RESET}  (baseline: 0.107)")
+    print(_divider())
+    print(f"  {BOLD}By scenario:{RESET}")
+    for scenario in ["buying", "browsing", "intent_override", "boundary"]:
+        m = result["scenario_metrics"].get(scenario)
+        if not m:
+            continue
+        hit_colour = GREEN if m["hit_rate_at_10"] >= 0.95 else (YELLOW if m["hit_rate_at_10"] >= 0.80 else RED)
+        print(
+            f"    {CYAN}{scenario:<18}{RESET}"
+            f"  HR {hit_colour}{m['hit_rate_at_10']:.3f}{RESET}"
+            f"  MRR {m['mrr']:.3f}"
+            f"  MTTC {m['mttc']:.1f}"
+            f"  ({m['sample_count']} sessions)"
+        )
+    print(f"{BOLD}{_divider('=')}{RESET}\n")
+
+
 def main():
     args         = sys.argv[1:]
     auto         = "--auto" in args
     run_all      = "--all"  in args
+    showcase     = "--showcase" in args
     pos_args     = [a for a in args if not a.startswith("--")]
     scenario_arg = pos_args[0] if pos_args else None
+    # `--showcase 2` means 2 examples per scenario; the count is a positional
+    # digit, not a scenario name, so it doesn't collide with scenario_arg below
+    showcase_n   = int(pos_args[0]) if showcase and pos_args and pos_args[0].isdigit() else 1
 
     scenario_types = {"buying", "browsing", "intent_override", "boundary"}
 
@@ -244,7 +282,21 @@ def main():
     agent   = Agent("data/catalog.jsonl")
     print(f"  {GREEN}Ready!{RESET}  {len(catalog_ids):,} products indexed.")
 
-    if run_all:
+    if showcase:
+        print(f"  Mode: {YELLOW}SHOWCASE{RESET}  --  {showcase_n} example(s) per scenario, "
+              f"then the real score over all {len(samples)} sessions\n")
+
+        for scenario in ["buying", "browsing", "intent_override", "boundary"]:
+            pool  = [s for s in samples if s["scenario_type"] == scenario]
+            picks = random.sample(pool, min(showcase_n, len(pool)))
+            for sample in picks:
+                run_session(agent, sample, products, catalog_ids, categories, auto)
+
+        print(f"{DIM}  Scoring all {len(samples)} public-set sessions with the official evaluator...{RESET}")
+        result = evaluate(agent, samples, catalog_ids, categories, products)
+        print_final_metrics(result)
+
+    elif run_all:
         # `demo.py buying --all` narrows to one scenario; plain `--all` runs
         # the full 200-session public set
         pool = (
