@@ -56,10 +56,6 @@ evaluator (`evaluator/local_evaluator.py`):
 | MTTC | 2.83 | 9.81 |
 | TechnicalScore | 0.948 | 0.107 |
 
-`test_new_dataset.py` reruns the same evaluator logic on 20 synthetic
-sessions built from catalog products the public set never touches, as a
-check that this isn't just overfit to the 200 labeled sessions.
-
 ## No LLM, on purpose
 
 Every `respond()` call reports `{"prompt_tokens": 0, "completion_tokens": 0}`
@@ -76,7 +72,6 @@ whole thing runs on the Python standard library: `sqlite3`, `re`, `json`,
 starter/agent.py                  the agent — indexing, parsing, filtering, ranking
 evaluator/local_evaluator.py      organizer's simulator and scorer (do not edit)
 demo.py                           terminal replay of a session, turn by turn
-test_new_dataset.py               generalization check on unseen products
 data/public_set.jsonl             200 labeled development sessions
 data/catalog.jsonl                50,000-product catalog (download separately, see below)
 docs/                             challenge spec, agent API contract, scoring config
@@ -97,7 +92,6 @@ Python 3.10+ is required; no pip install needed.
 ```bash
 python3 -m evaluator.local_evaluator     # score against the public set
 python3 demo.py buying --auto            # watch one session play out in the terminal
-python3 test_new_dataset.py              # generalization check on unseen products
 ```
 
 ## Agent interface
