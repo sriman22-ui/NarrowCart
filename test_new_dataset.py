@@ -29,7 +29,8 @@ catalog_ids, categories, products = catalog_index("data/catalog.jsonl")
 public_samples  = load_jsonl("data/public_set.jsonl")
 public_asins    = {str(s["ground_truth"]["parent_asin"]) for s in public_samples}
 
-# Products not seen in the public test set
+# the public set's 200 sessions each target one specific product — excluding
+# those asins means the agent has never seen these products get talked about
 unseen_asins = [a for a in catalog_ids if a not in public_asins]
 print(f"  {len(catalog_ids):,} total products | {len(public_asins)} in public set | "
       f"{len(unseen_asins):,} unseen")
@@ -52,6 +53,8 @@ for i, asin in enumerate(chosen_asins):
         "user_profile":   {},
         "difficulty_bucket": "synthetic",
     }
+    # organizer function — builds the intent card & customer-reply script
+    # from the target product's own metadata, same as it does for public_set.jsonl
     card, behavior = materialize_hidden_fields(sample, products)
     sample["intent_card"] = card
     sample["behavior"]    = behavior
@@ -149,5 +152,5 @@ for sc in SCENARIOS:
     print(f"  {sc:<18}  HR {g_hr:.3f}  MRR {g_mrr:.3f}  MTTC {g_mttc:.1f}  ({sum(1 for r in grp if r['hit'])}/{len(grp)})")
 print("=" * 65)
 print()
-print("  Compare — public set:  HR 0.995  MRR 0.844  TS 0.911")
+print("  Compare — public set:  HR 0.995  MRR 0.957  TS 0.948")
 print(f"  Compare — synthetic:   HR {hit_rate:.3f}  MRR {mrr:.3f}  TS {tech_score:.3f}")

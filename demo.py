@@ -49,6 +49,8 @@ AUTO_PAUSE = 2.5
 
 def _safe(text: str) -> str:
     """Strip non-ASCII characters so Windows cp1252 terminal never crashes."""
+    # product titles sometimes carry curly quotes / em dashes that raise
+    # UnicodeEncodeError on the default Windows console codepage
     return text.encode("ascii", errors="replace").decode("ascii")
 
 
@@ -243,7 +245,8 @@ def main():
     print(f"  {GREEN}Ready!{RESET}  {len(catalog_ids):,} products indexed.")
 
     if run_all:
-        # filter by scenario if provided, else all 200
+        # `demo.py buying --all` narrows to one scenario; plain `--all` runs
+        # the full 200-session public set
         pool = (
             [s for s in samples if s["scenario_type"] == scenario_arg]
             if scenario_arg in scenario_types

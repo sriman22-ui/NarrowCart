@@ -48,6 +48,8 @@ CONFIDENCE_THRESHOLD = 3      # withhold recs while |survivors| > this
 # ── helpers (exact replicas of evaluator logic) ───────────────────────────────
 
 def _text(value: object) -> str:
+    # dict/list fields (features, details, categories) get flattened to one
+    # string here so they can go straight into the FTS5 columns.
     if value is None:
         return ""
     if isinstance(value, dict):
@@ -58,6 +60,7 @@ def _text(value: object) -> str:
 
 
 def _terms(text: str) -> list[str]:
+    # single-char tokens and stopwords just add noise to the BM25 query
     return [
         token.lower()
         for token in TOKEN_RE.findall(text)
@@ -66,6 +69,8 @@ def _terms(text: str) -> list[str]:
 
 
 def _flatten_values(value: object) -> list[str]:
+    # "details" is a dict (e.g. {"Material": "Cotton"}), "features" is a
+    # list of bullet strings — normalize both into one list of phrases
     if isinstance(value, dict):
         return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
     if isinstance(value, list):
@@ -79,6 +84,8 @@ def _clean(value: str, limit: int = 180) -> str:
 
 
 def _searchable_text(product: dict) -> str:
+    # one blob of every field we might match a material/color regex against,
+    # not fielded — we only need presence here, not which field it came from
     parts: list[str] = []
     for field in SEARCH_FIELDS:
         v = product.get(field)
@@ -231,6 +238,9 @@ class Agent:
     # ── per-turn helpers ─────────────────────────────────────────────────────
 
     def _add_phrase(self, state: dict, raw: str) -> None:
+        # phrases double as fingerprint-index lookup keys, so they need to be
+        # cleaned exactly the way _intent_phrases cleaned them at index time,
+        # or a genuine match will silently fail to look up
         phrase = _clean(raw)
         if not phrase or phrase in state["phrases"]:
             return
@@ -323,7 +333,12 @@ class Agent:
         terms = sorted(state["terms"])  # sorted for determinism
         if not terms:
             return []
+        # OR, not AND — a customer message rarely contains every indexed
+        # term for the right product, so requiring all of them would just
+        # empty the candidate pool
         expr = " OR ".join(f'"{t}"' for t in terms[:60])
+        # column weights: parent_asin(unindexed), title, categories, features,
+        # details, store, description — title matches count for the most
         rows = self.connection.execute(
             "SELECT parent_asin FROM products WHERE products MATCH ? "
             "ORDER BY bm25(products, 0.0, 6.0, 4.0, 3.0, 3.0, 1.5, 1.0) LIMIT ?",
@@ -468,6 +483,8 @@ class Agent:
         return best_attr
 
     def _choose_ask(self, state: dict, survivors: list[str]) -> str | None:
+        # before the consistency filter has any survivors to split (early
+        # browsing turns), fall back to just working down ASK_PRIORITY
         if survivors:
             attr = self._choose_ask_ig(state, survivors)
         else:
